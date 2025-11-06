@@ -79,10 +79,26 @@ def main():
     ap.add_argument("--do_eval", action="store_true",
                     help="Whether to run evaluation")
 
+    # Save the trained LoRA adapter to this directory
+    ap.add_argument("--adapter_output_dir", type=str, default=None,
+                    help="Directory to save the trained LoRA adapter. Defaults to <output_dir>/<task_name>_<model_size>/r<lora_r>/adapter")
+
     # Parse arguments and set up environment
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)  # Create output directory if needed
     set_global_seed(args.seed)  # Set random seeds for NumPy, PyTorch, etc.
+    
+    # Set default adapter_output_dir if not specified (includes rank for comparison)
+    if args.adapter_output_dir is None:
+        args.adapter_output_dir = os.path.join(args.output_dir, f"{args.task_name}_{args.model_size}", f"r{args.lora_r}", "adapter")
+    
+    # Create the training and adapter output directories immediately so they're visible
+    training_output_dir = os.path.join(args.output_dir, f"{args.task_name}_{args.model_size}", f"r{args.lora_r}")
+    os.makedirs(training_output_dir, exist_ok=True)
+    if args.do_train:
+        os.makedirs(args.adapter_output_dir, exist_ok=True)
+        print(f"📁 Training output: {training_output_dir}")
+        print(f"📁 Adapter will be saved to: {args.adapter_output_dir}")
 
     # ==================== Data Loading & Tokenization ====================
     # Resolve model identifier (e.g., "base" -> "roberta-base")
@@ -128,7 +144,7 @@ def main():
 
     # Configure training arguments for HuggingFace Trainer
     training_args = TrainingArguments(
-        output_dir=os.path.join(args.output_dir, f"{args.task_name}_{args.model_size}"),
+        output_dir=training_output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         do_train=args.do_train,
@@ -160,6 +176,10 @@ def main():
         trainer.train()
         print(f"Training complete for dataset: {args.task_name}!")
 
+    if args.do_train and args.adapter_output_dir:
+        # Save ONLY the LoRA adapter weights + config (what fedavg_merge needs)
+        model.save_pretrained(args.adapter_output_dir)
+        print(f"💾 Saved LoRA adapter to: {args.adapter_output_dir}")
     # ==================== Evaluation ====================
     results = {}
     if args.do_eval:
