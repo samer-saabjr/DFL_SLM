@@ -9,10 +9,10 @@ import numpy as np
 from transformers import Trainer, TrainingArguments
 from peft import PeftModel
 
-from .data_prep import load_and_tokenize, eval_split_names
-from .metrics import build_metric_fn, evaluate_mnli_overall
-from .models import resolve_model_id
-from .utils import set_global_seed
+from data_prep import load_and_tokenize, eval_split_names
+from metrics import build_metric_fn, evaluate_mnli_overall
+from models import resolve_model_id
+from utils import set_global_seed
 
 def main():
     ap = argparse.ArgumentParser()
@@ -51,7 +51,7 @@ def main():
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         do_train=False,
         do_eval=True,
-        evaluation_strategy="no",
+        eval_strategy="no",
         logging_steps=100,
         report_to="none",
         seed=args.seed,
