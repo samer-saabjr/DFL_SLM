@@ -61,6 +61,34 @@ def _weighted_average(all_deltas: List[Dict[str, torch.Tensor]], weights: List[f
         avg[n] = acc
     return avg
 
+def _collect_lora_params(model: PeftModel) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    """Collect raw A and B matrices (without computing delta)"""
+    params = {}
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+            if "default" in module.lora_A.keys():
+                A = module.lora_A["default"].weight.data.detach().float().cpu()
+                B = module.lora_B["default"].weight.data.detach().float().cpu()
+                params[name] = (A, B)
+    return params
+
+def _average_lora_params(all_params: List[Dict[str, Tuple[torch.Tensor, torch.Tensor]]], 
+                         weights: List[float]) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    """Average A and B matrices separately (naive LoRA FedAvg)"""
+    wsum = sum(weights); w = [wi/wsum for wi in weights]
+    names = all_params[0].keys()
+    avg = {}
+    for n in names:
+        A_acc, B_acc = None, None
+        for params, wi in zip(all_params, w):
+            A, B = params[n]
+            A_weighted = A * wi
+            B_weighted = B * wi
+            A_acc = A_weighted if A_acc is None else (A_acc + A_weighted)
+            B_acc = B_weighted if B_acc is None else (B_acc + B_weighted)
+        avg[n] = (A_acc, B_acc)
+    return avg
+
 def _svd_factorize_to_lora(M: torch.Tensor, r: int) -> Tuple[torch.Tensor, torch.Tensor]:
     U, S, Vh = torch.linalg.svd(M, full_matrices=False)
     r = min(r, U.shape[1], Vh.shape[0])
@@ -150,9 +178,11 @@ def main():
     ap.add_argument("--svd_rank", type=int, default=8)
     ap.add_argument("--alpha", type=int, default=None, help="Alpha for fused adapter; default=r.")
     ap.add_argument("--init_adapter", type=str, default=None, help="Optional starting adapter (round 1 broadcast).")
+    ap.add_argument("--skip_svd", action="store_true", help="Skip SVD compression; directly average A/B matrices (naive LoRA FedAvg).")
 
     ap.add_argument("--output_root", type=str, default="./out_fedavg")
     ap.add_argument("--eval_each_round", action="store_true")
+    ap.add_argument("--eval_clients", action="store_true", help="Evaluate each client individually after training.")
     ap.add_argument("--eval_batch_size", type=int, default=32)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -205,35 +235,83 @@ def main():
             )
             adapter_paths.append(apath)
             print(f"  ✅ client {i} adapter: {apath}")
+            
+            # Optional: evaluate individual client
+            if args.eval_clients:
+                is_mnli = (args.task_name.lower() == "mnli")
+                eval_ds = tokenized_all["validation_mismatched"] if is_mnli else tokenized_all["validation"]
+                from transformers import TrainingArguments
+                targs = TrainingArguments(output_dir=os.path.join(c_out, "eval_tmp"),
+                                          per_device_eval_batch_size=args.eval_batch_size,
+                                          do_eval=True, report_to="none")
+                client_model = PeftModel.from_pretrained(_build_base(model_id, num_labels, is_reg), apath)
+                trainer = Trainer(model=client_model, args=targs, eval_dataset=eval_ds, tokenizer=tok,
+                                  compute_metrics=build_metric_fn(args.task_name))
+                if is_mnli:
+                    res = evaluate_mnli_overall(trainer, tokenized_all)
+                else:
+                    res = trainer.evaluate()
+                print(f"     📊 Client {i} metrics:", {k: float(v) if hasattr(v, "__float__") else v for k, v in res.items()})
+                del client_model, trainer
 
-        # FedAvg ΔW
+        # FedAvg aggregation
         base_tmp = _build_base(model_id, num_labels, is_reg)
-        all_d = []
-        for apath in adapter_paths:
-            m = PeftModel.from_pretrained(base_tmp, apath)
-            all_d.append(_collect_lora_deltas(m))
-            del m
         weights = sizes  # sample-count weighting
-        fused = _weighted_average(all_d, weights)
+        
+        if args.skip_svd:
+            # Naive LoRA FedAvg: directly average A and B matrices
+            print("  🔀 Aggregating via naive LoRA averaging (no SVD)...")
+            all_params = []
+            for apath in adapter_paths:
+                m = PeftModel.from_pretrained(base_tmp, apath)
+                all_params.append(_collect_lora_params(m))
+                del m
+            fused_params = _average_lora_params(all_params, weights)
+            
+            # Build fused model and assign averaged A/B
+            fused_dir = os.path.join(round_dir, f"fused_r{args.lora_r}_nosvd")
+            os.makedirs(fused_dir, exist_ok=True)
+            
+            base_write = _build_base(model_id, num_labels, is_reg)
+            fused_model = _attach_new_lora(base_write, r=args.lora_r, alpha=args.lora_alpha,
+                                           dropout=0.0, target_modules=args.target_modules)
+            
+            for name, module in fused_model.named_modules():
+                if hasattr(module, "lora_A") and hasattr(module, "lora_B") and "default" in module.lora_A.keys():
+                    if name not in fused_params:
+                        continue
+                    A_avg, B_avg = fused_params[name]
+                    with torch.no_grad():
+                        module.lora_A["default"].weight.copy_(A_avg.to(module.lora_A["default"].weight.dtype))
+                        module.lora_B["default"].weight.copy_(B_avg.to(module.lora_B["default"].weight.dtype))
+        else:
+            # Original: compute full ΔW, average, then SVD back to rank-r
+            print("  🔀 Aggregating via ΔW averaging + SVD compression...")
+            all_d = []
+            for apath in adapter_paths:
+                m = PeftModel.from_pretrained(base_tmp, apath)
+                all_d.append(_collect_lora_deltas(m))
+                del m
+            fused = _weighted_average(all_d, weights)
 
-        # Build fused skeleton and assign SVD(B@A) with new scaling
-        fused_dir = os.path.join(round_dir, f"fused_r{args.svd_rank}")
-        os.makedirs(fused_dir, exist_ok=True)
-        scaling_new = alpha_fused / args.svd_rank
+            # Build fused skeleton and assign SVD(B@A) with new scaling
+            fused_dir = os.path.join(round_dir, f"fused_r{args.svd_rank}")
+            os.makedirs(fused_dir, exist_ok=True)
+            scaling_new = alpha_fused / args.svd_rank
 
-        base_write = _build_base(model_id, num_labels, is_reg)
-        fused_model = _attach_new_lora(base_write, r=args.svd_rank, alpha=alpha_fused,
-                                       dropout=0.0, target_modules=args.target_modules)
+            base_write = _build_base(model_id, num_labels, is_reg)
+            fused_model = _attach_new_lora(base_write, r=args.svd_rank, alpha=alpha_fused,
+                                           dropout=0.0, target_modules=args.target_modules)
 
-        for name, module in fused_model.named_modules():
-            if hasattr(module, "lora_A") and hasattr(module, "lora_B") and "default" in module.lora_A.keys():
-                if name not in fused:  # skip non-LoRA modules
-                    continue
-                M = fused[name] / scaling_new
-                B, A = _svd_factorize_to_lora(M, r=args.svd_rank)
-                with torch.no_grad():
-                    module.lora_A["default"].weight.copy_(A.to(module.lora_A["default"].weight.dtype))
-                    module.lora_B["default"].weight.copy_(B.to(module.lora_B["default"].weight.dtype))
+            for name, module in fused_model.named_modules():
+                if hasattr(module, "lora_A") and hasattr(module, "lora_B") and "default" in module.lora_A.keys():
+                    if name not in fused:  # skip non-LoRA modules
+                        continue
+                    M = fused[name] / scaling_new
+                    B, A = _svd_factorize_to_lora(M, r=args.svd_rank)
+                    with torch.no_grad():
+                        module.lora_A["default"].weight.copy_(A.to(module.lora_A["default"].weight.dtype))
+                        module.lora_B["default"].weight.copy_(B.to(module.lora_B["default"].weight.dtype))
 
         fused_model.save_pretrained(fused_dir)
         fused_prev = fused_dir  # broadcast next round
