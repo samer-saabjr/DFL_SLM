@@ -89,6 +89,28 @@ def _average_lora_params(all_params: List[Dict[str, Tuple[torch.Tensor, torch.Te
         avg[n] = (A_acc, B_acc)
     return avg
 
+def _collect_classifier_weights(base_model) -> Dict[str, torch.Tensor]:
+    """Collect classification head weights"""
+    weights = {}
+    for name, param in base_model.named_parameters():
+        if "classifier" in name:
+            weights[name] = param.data.detach().float().cpu()
+    return weights
+
+def _average_classifier_weights(all_weights: List[Dict[str, torch.Tensor]], 
+                                weights: List[float]) -> Dict[str, torch.Tensor]:
+    """Average classification head weights"""
+    wsum = sum(weights); w = [wi/wsum for wi in weights]
+    names = all_weights[0].keys()
+    avg = {}
+    for n in names:
+        acc = None
+        for clf_w, wi in zip(all_weights, w):
+            t = clf_w[n] * wi
+            acc = t if acc is None else (acc + t)
+        avg[n] = acc
+    return avg
+
 def _svd_factorize_to_lora(M: torch.Tensor, r: int) -> Tuple[torch.Tensor, torch.Tensor]:
     U, S, Vh = torch.linalg.svd(M, full_matrices=False)
     r = min(r, U.shape[1], Vh.shape[0])
@@ -118,7 +140,7 @@ def _train_one_client(
     lora_r: int,
     lora_alpha: int,
     lora_dropout: float,
-    init_adapter: Optional[str],  # fused adapter from prev round or None
+    init_model_dir: Optional[str],  # full model dir from prev round or None
     target_modules: List[str],
     epochs: float,
     bs: int,
@@ -133,13 +155,15 @@ def _train_one_client(
     eval_ds = tokenized["validation_mismatched"] if task=="mnli" else tokenized["validation"]
 
     # Model
-    base = _build_base(model_id, num_labels, is_reg)
-    if init_adapter:
-        model = PeftModel.from_pretrained(base, init_adapter)
+    if init_model_dir:
+        # Load full model from previous round (base + classifier + adapter)
+        base = torch.load(os.path.join(init_model_dir, "base_model.pt"), weights_only=False)
+        model = PeftModel.from_pretrained(base, os.path.join(init_model_dir, "adapter"))
     else:
+        base = _build_base(model_id, num_labels, is_reg)
         model = _attach_new_lora(base, r=lora_r, alpha=lora_alpha, dropout=lora_dropout, target_modules=target_modules)
 
-    # Train LoRA only
+    # Train LoRA + classification head
     args = TrainingArguments(
         output_dir=os.path.join(out_dir, "ckpt"),
         per_device_train_batch_size=bs,
@@ -155,10 +179,11 @@ def _train_one_client(
     trainer = Trainer(model=model, args=args, train_dataset=train_subset, eval_dataset=None, tokenizer=tok)
     trainer.train()
 
-    # Save adapter
+    # Save adapter AND base model (includes classification head)
     adapter_dir = os.path.join(out_dir, "adapter")
     model.save_pretrained(adapter_dir)
-    return adapter_dir
+    torch.save(model.get_base_model(), os.path.join(out_dir, "base_model.pt"))
+    return out_dir
 
 def main():
     ap = argparse.ArgumentParser()
@@ -207,7 +232,16 @@ def main():
     # Optional: tokenization once for eval
     tokenized_all, num_labels, is_reg, tok = load_and_tokenize(args.task_name, model_id, max_length=128)
 
-    fused_prev: Optional[str] = args.init_adapter  # adapter path to broadcast
+    fused_prev: Optional[str] = None  # full model dir to broadcast
+    if args.init_adapter:
+        # Convert old-style adapter path to full model dir format
+        import tempfile
+        fused_prev = tempfile.mkdtemp()
+        base = _build_base(model_id, num_labels, is_reg)
+        torch.save(base, os.path.join(fused_prev, "base_model.pt"))
+        # Assume adapter is at args.init_adapter
+        import shutil
+        shutil.copytree(args.init_adapter, os.path.join(fused_prev, "adapter"))
     for r in range(1, args.rounds + 1):
         print(f"\n===== ROUND {r}/{args.rounds} =====")
 
@@ -215,17 +249,17 @@ def main():
         os.makedirs(round_dir, exist_ok=True)
 
         # Local training per client
-        adapter_paths = []
+        client_dirs = []
         for i, idxs in enumerate(clients, start=1):
             c_out = os.path.join(round_dir, f"client_{i}")
-            apath = _train_one_client(
+            client_dir = _train_one_client(
                 model_id=model_id,
                 task=args.task_name,
                 indices=idxs,
                 lora_r=args.lora_r,
                 lora_alpha=args.lora_alpha,
                 lora_dropout=args.lora_dropout,
-                init_adapter=fused_prev,
+                init_model_dir=fused_prev,
                 target_modules=args.target_modules,
                 epochs=args.local_epochs,
                 bs=args.batch_size,
@@ -233,8 +267,8 @@ def main():
                 seed=args.seed,
                 out_dir=c_out
             )
-            adapter_paths.append(apath)
-            print(f"  ✅ client {i} adapter: {apath}")
+            client_dirs.append(client_dir)
+            print(f"  ✅ client {i} saved to: {client_dir}")
             
             # Optional: evaluate individual client
             if args.eval_clients:
@@ -244,7 +278,8 @@ def main():
                 targs = TrainingArguments(output_dir=os.path.join(c_out, "eval_tmp"),
                                           per_device_eval_batch_size=args.eval_batch_size,
                                           do_eval=True, report_to="none")
-                client_model = PeftModel.from_pretrained(_build_base(model_id, num_labels, is_reg), apath)
+                base_client = torch.load(os.path.join(client_dir, "base_model.pt"), weights_only=False)
+                client_model = PeftModel.from_pretrained(base_client, os.path.join(client_dir, "adapter"))
                 trainer = Trainer(model=client_model, args=targs, eval_dataset=eval_ds, tokenizer=tok,
                                   compute_metrics=build_metric_fn(args.task_name))
                 if is_mnli:
@@ -252,20 +287,30 @@ def main():
                 else:
                     res = trainer.evaluate()
                 print(f"     📊 Client {i} metrics:", {k: float(v) if hasattr(v, "__float__") else v for k, v in res.items()})
-                del client_model, trainer
+                del client_model, trainer, base_client
 
         # FedAvg aggregation
         base_tmp = _build_base(model_id, num_labels, is_reg)
         weights = sizes  # sample-count weighting
         
+        # Collect and average classifier weights from all clients
+        print("  🔀 Aggregating classification heads...")
+        all_classifier_weights = []
+        for client_dir in client_dirs:
+            base_client = torch.load(os.path.join(client_dir, "base_model.pt"), weights_only=False)
+            all_classifier_weights.append(_collect_classifier_weights(base_client))
+            del base_client
+        fused_classifier = _average_classifier_weights(all_classifier_weights, weights)
+        
         if args.skip_svd:
             # Naive LoRA FedAvg: directly average A and B matrices
-            print("  🔀 Aggregating via naive LoRA averaging (no SVD)...")
+            print("  🔀 Aggregating LoRA via naive averaging (no SVD)...")
             all_params = []
-            for apath in adapter_paths:
-                m = PeftModel.from_pretrained(base_tmp, apath)
+            for client_dir in client_dirs:
+                base_client = torch.load(os.path.join(client_dir, "base_model.pt"), weights_only=False)
+                m = PeftModel.from_pretrained(base_client, os.path.join(client_dir, "adapter"))
                 all_params.append(_collect_lora_params(m))
-                del m
+                del m, base_client
             fused_params = _average_lora_params(all_params, weights)
             
             # Build fused model and assign averaged A/B
@@ -286,12 +331,13 @@ def main():
                         module.lora_B["default"].weight.copy_(B_avg.to(module.lora_B["default"].weight.dtype))
         else:
             # Original: compute full ΔW, average, then SVD back to rank-r
-            print("  🔀 Aggregating via ΔW averaging + SVD compression...")
+            print("  🔀 Aggregating LoRA via ΔW averaging + SVD compression...")
             all_d = []
-            for apath in adapter_paths:
-                m = PeftModel.from_pretrained(base_tmp, apath)
+            for client_dir in client_dirs:
+                base_client = torch.load(os.path.join(client_dir, "base_model.pt"), weights_only=False)
+                m = PeftModel.from_pretrained(base_client, os.path.join(client_dir, "adapter"))
                 all_d.append(_collect_lora_deltas(m))
-                del m
+                del m, base_client
             fused = _weighted_average(all_d, weights)
 
             # Build fused skeleton and assign SVD(B@A) with new scaling
@@ -313,9 +359,19 @@ def main():
                         module.lora_A["default"].weight.copy_(A.to(module.lora_A["default"].weight.dtype))
                         module.lora_B["default"].weight.copy_(B.to(module.lora_B["default"].weight.dtype))
 
-        fused_model.save_pretrained(fused_dir)
+        # Apply averaged classifier weights to fused model
+        base_fused = fused_model.get_base_model()
+        for name, param in base_fused.named_parameters():
+            if name in fused_classifier:
+                with torch.no_grad():
+                    param.copy_(fused_classifier[name].to(param.dtype).to(param.device))
+        
+        # Save fused model (adapter + base with averaged classifier)
+        adapter_save_dir = os.path.join(fused_dir, "adapter")
+        fused_model.save_pretrained(adapter_save_dir)
+        torch.save(base_fused, os.path.join(fused_dir, "base_model.pt"))
         fused_prev = fused_dir  # broadcast next round
-        print(f"  🔗 fused adapter saved: {fused_dir}")
+        print(f"  🔗 fused model saved: {fused_dir}")
 
         # Optional dev eval (quick)
         if args.eval_each_round:
@@ -325,14 +381,16 @@ def main():
             targs = TrainingArguments(output_dir=os.path.join(fused_dir, "eval_tmp"),
                                       per_device_eval_batch_size=args.eval_batch_size,
                                       do_eval=True, report_to="none")
-            eval_model = PeftModel.from_pretrained(_build_base(model_id, num_labels, is_reg), fused_dir)
+            base_eval = torch.load(os.path.join(fused_dir, "base_model.pt"), weights_only=False)
+            eval_model = PeftModel.from_pretrained(base_eval, os.path.join(fused_dir, "adapter"))
             trainer = Trainer(model=eval_model, args=targs, eval_dataset=eval_ds, tokenizer=tok,
                               compute_metrics=build_metric_fn(args.task_name))
             if is_mnli:
                 res = evaluate_mnli_overall(trainer, tokenized_all)
             else:
                 res = trainer.evaluate()
-            print("  📊 dev metrics:", {k: float(v) if hasattr(v, "__float__") else v for k, v in res.items()})
+            print("  📊 Fused model metrics:", {k: float(v) if hasattr(v, "__float__") else v for k, v in res.items()})
+            del eval_model, trainer, base_eval
 
     print("\n✅ Multi-round FedAvg completed.")
 
