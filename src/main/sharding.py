@@ -83,17 +83,17 @@ def _indices_by_key(examples: Dict[str, Any], key: str) -> Dict[Any, List[int]]:
 def make_client_splits(
     task_name: str,
     k: int,
-    mode: str = "iid",           # "iid" | "overlap" | "category"
+    mode: str = "iid",           # "iid" | "overlap" | "category" | "category_overlap"
     seed: int = 42,
-    overlap_ratio: float = 0.0,  # only for mode="overlap": fraction of train reused across clients
-    category_key: Optional[str] = None,  # only for mode="category": e.g., "label", "genre", or custom column
+    overlap_ratio: float = 0.0,  # only for mode="overlap" and "category_overlap": fraction of train reused across clients
+    category_key: Optional[str] = None,  # only for mode="category" and "category_overlap": e.g., "label", "genre", or custom column
     bin_stsb: bool = True,       # for STS-B score binning if category_key is "labels" (regression)
 ) -> Dict[str, Any]:
     """
     Create federated learning data splits for a GLUE task's training set.
     
     This function partitions the training data of a GLUE benchmark task across
-    k clients using one of three strategies:
+    k clients using one of four strategies:
     
     1. **IID Mode (Independent and Identically Distributed)**:
        - Stratified random sampling maintaining label distribution
@@ -109,14 +109,20 @@ def make_client_splits(
        - Entire categories/labels assigned to specific clients
        - Creates heterogeneous data distribution across clients
        - Simulates real-world federated scenarios with biased local data
+       
+    4. **Category Overlap Mode (Non-IID with Overlap)**:
+       - First assigns entire categories to specific clients (like Category mode)
+       - Then adds overlapping samples from a shared pool across all clients
+       - Combines non-IID distribution with data redundancy
+       - Simulates scenarios with biased local data but some shared knowledge
     
     Args:
         task_name: GLUE task name (e.g., "sst2", "mnli", "qqp", "stsb")
         k: Number of federated learning clients
-        mode: Sharding strategy - "iid", "overlap", or "category"
+        mode: Sharding strategy - "iid", "overlap", "category", or "category_overlap"
         seed: Random seed for reproducibility
-        overlap_ratio: [overlap mode only] Fraction of data shared across clients (0.0 to 1.0)
-        category_key: [category mode only] Column to partition by (e.g., "label", "genre")
+        overlap_ratio: [overlap/category_overlap modes] Fraction of data shared across clients (0.0 to 1.0)
+        category_key: [category/category_overlap modes] Column to partition by (e.g., "label", "genre")
         bin_stsb: Whether to bin STS-B regression scores into discrete categories
         
     Returns:
@@ -264,8 +270,55 @@ def make_client_splits(
         for ci in client_indices:
             rng.shuffle(ci)
 
+    # ========================================================================
+    # Mode 4: Category Overlap (Non-IID with Overlap)
+    # ========================================================================
+    elif mode == "category_overlap":
+        # Validate required parameters
+        assert category_key is not None, "Provide category_key for category_overlap mode."
+        assert 0.0 <= overlap_ratio < 1.0, "overlap_ratio must be in [0,1)"
+        
+        # Step 1: Group examples by category (same as category mode)
+        key = category_key
+        if key == "labels" and task == "stsb" and bin_stsb:
+            # Special case: STS-B with binned regression scores
+            scores = train["label"] if "label" in train.column_names else train["score"]
+            bins = _bin_scores(scores, bin_width=0.2)
+            buckets = _indices_by_key({"bin": bins}, "bin")
+        else:
+            # General case: use specified column as category
+            if key not in train.column_names:
+                raise ValueError(f"{key} not found in train columns: {train.column_names}")
+            buckets = _indices_by_key(train, key)
+
+        # Step 2: Assign categories to clients (creating base non-IID distribution)
+        cats = list(buckets.keys())
+        rng.shuffle(cats)  # Randomize category assignment order
+        client_indices = [[] for _ in range(k)]
+        for i, c in enumerate(cats):
+            # Category i goes to client (i % k)
+            client_indices[i % k].extend(buckets[c])
+        
+        # Step 3: Create shared overlap pool from all data
+        overlap_pool = list(range(n))
+        rng.shuffle(overlap_pool)
+        
+        # Step 4: Add overlapping samples to each client
+        # Each client gets overlap_ratio * (their_base_size) additional samples from the pool
+        for i, base_indices in enumerate(client_indices):
+            base_size = len(base_indices)
+            overlap_sz = int(overlap_ratio * base_size)
+            
+            # Sample from overlap pool (may include samples from other categories)
+            overlap_chunk = [overlap_pool[rng.randrange(n)] for _ in range(overlap_sz)]
+            
+            # Combine base category data with overlap data, remove duplicates
+            combined = list(set(base_indices + overlap_chunk))
+            rng.shuffle(combined)
+            client_indices[i] = combined
+
     else:
-        raise ValueError("mode must be one of: iid | overlap | category")
+        raise ValueError("mode must be one of: iid | overlap | category | category_overlap")
 
     # ========================================================================
     # Return Shard Manifest
