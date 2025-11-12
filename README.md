@@ -574,32 +574,3 @@ pip install --upgrade -r requirements.txt
 ### Issue: "Adapter path does not exist"
 **Solution:** Train adapters first using `main_glue_lora.py` before merging with `fedavg_merge.py`.
 
----
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@software{dfl_slm_2025,
-  title = {DFL_SLM: Federated Learning with Small Language Models using LoRA},
-  author = {Your Name},
-  year = {2025},
-  url = {https://github.com/yourusername/DFL_SLM}
-}
-```
-
----
-
-## License
-
-This project is licensed under the MIT License. See LICENSE file for details.
-
----
-
-## Acknowledgments
-
-- **HuggingFace** for Transformers, PEFT, and Datasets libraries
-- **GLUE Benchmark** authors for evaluation framework
-- **LoRA** (Hu et al., 2021) for parameter-efficient fine-tuning
-- **FedAvg** (McMahan et al., 2017) for federated learning framework
